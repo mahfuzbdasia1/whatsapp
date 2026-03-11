@@ -19,7 +19,9 @@ import {
   Trash2,
   FileText,
   Zap,
-  Edit2
+  Edit2,
+  UserCheck,
+  ShieldCheck
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { io, Socket } from 'socket.io-client';
@@ -82,7 +84,7 @@ const SidebarItem = ({ icon: Icon, label, active, onClick }: { icon: any, label:
 );
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'contacts' | 'campaign' | 'history' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'contacts' | 'campaign' | 'history' | 'settings' | 'verifier'>('dashboard');
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [qr, setQr] = useState<string | null>(null);
   const [userPhone, setUserPhone] = useState<string | null>(null);
@@ -98,21 +100,39 @@ export default function App() {
   const [newTemplateName, setNewTemplateName] = useState('');
   const [newKeyword, setNewKeyword] = useState('');
   const [newResponse, setNewResponse] = useState('');
+  
+  // New Contact State
+  const [newContactName, setNewContactName] = useState('');
+  const [newContactPhone, setNewContactPhone] = useState('');
+  const [isAddingContact, setIsAddingContact] = useState(false);
+  
+  // Verifier State
+  const [verifyInput, setVerifyInput] = useState('');
+  const [verifyResults, setVerifyResults] = useState<{ phone: string, exists: boolean, error?: boolean }[]>([]);
+  const [isVerifying, setIsVerifying] = useState(false);
+
   const socketRef = useRef<Socket | null>(null);
 
   useEffect(() => {
     // Initialize socket
     socketRef.current = io();
 
-    socketRef.current.on('whatsapp-status', (data: { status: ConnectionStatus, qr?: string, userPhone?: string }) => {
+    socketRef.current.on('whatsapp-status', (data: { status: ConnectionStatus, qr?: string, userPhone?: string, error?: string }) => {
       setStatus(data.status);
       if (data.qr) setQr(data.qr);
       if (data.userPhone) setUserPhone(data.userPhone);
+      if (data.error) {
+        console.error('WhatsApp Connection Error:', data.error);
+      }
     });
 
     socketRef.current.on('send-progress', (data: { phone: string, status: 'sent' | 'failed' }) => {
       setSendingProgress(prev => ({ ...prev, current: prev.current + 1 }));
       fetchHistory();
+    });
+
+    socketRef.current.on('campaign-finished', () => {
+      setIsSending(false);
     });
 
     // Initial data fetch
@@ -127,15 +147,19 @@ export default function App() {
     };
   }, []);
 
-  const fetchStatus = async () => {
+  const fetchStatus = async (retries = 3) => {
     try {
       const res = await fetch('/api/status');
+      if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
       const data = await res.json();
       setStatus(data.status);
       setQr(data.qr);
       setUserPhone(data.userPhone);
     } catch (e) {
-      console.error('Failed to fetch status');
+      console.error('Failed to fetch status', e);
+      if (retries > 0) {
+        setTimeout(() => fetchStatus(retries - 1), 2000);
+      }
     }
   };
 
@@ -176,6 +200,19 @@ export default function App() {
       setAutoReplies(data);
     } catch (e) {
       console.error('Failed to fetch auto replies');
+    }
+  };
+
+  const toggleAutoReply = async (id: number, enabled: boolean) => {
+    try {
+      await fetch(`/api/autoreplies/${id}/toggle`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      fetchAutoReplies();
+    } catch (e) {
+      console.error('Failed to toggle auto reply');
     }
   };
 
@@ -225,6 +262,29 @@ export default function App() {
       fetchAutoReplies();
     } catch (e) {
       console.error('Failed to delete auto reply');
+    }
+  };
+
+  const addSingleContact = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newContactName || !newContactPhone) return;
+    try {
+      const res = await fetch('/api/contacts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newContactName, phone: newContactPhone }),
+      });
+      if (res.ok) {
+        setNewContactName('');
+        setNewContactPhone('');
+        setIsAddingContact(false);
+        fetchContacts();
+      } else {
+        const data = await res.json();
+        alert(data.error || 'Failed to add contact');
+      }
+    } catch (e) {
+      console.error('Failed to add contact');
     }
   };
 
@@ -337,6 +397,36 @@ export default function App() {
     }
   };
 
+  const handleVerifyNumbers = async () => {
+    const numbers = verifyInput.split(/[\n,]+/).map(n => n.trim()).filter(n => n);
+    if (numbers.length === 0) return;
+
+    setIsVerifying(true);
+    setVerifyResults([]);
+    
+    try {
+      const res = await fetch('/api/verify-numbers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ numbers }),
+      });
+      const data = await res.json();
+      setVerifyResults(data);
+    } catch (e) {
+      console.error('Verification failed');
+    } finally {
+      setIsVerifying(false);
+    }
+  };
+
+  const stopCampaign = async () => {
+    try {
+      await fetch('/api/stop-campaign', { method: 'POST' });
+    } catch (e) {
+      console.error('Failed to stop campaign');
+    }
+  };
+
   const stats = {
     total: contacts.length,
     sent: logs.filter(l => l.status === 'sent').length,
@@ -380,6 +470,12 @@ export default function App() {
             label="Campaign" 
             active={activeTab === 'campaign'} 
             onClick={() => setActiveTab('campaign')} 
+          />
+          <SidebarItem 
+            icon={UserCheck} 
+            label="Verifier" 
+            active={activeTab === 'verifier'} 
+            onClick={() => setActiveTab('verifier')} 
           />
           <SidebarItem 
             icon={History} 
@@ -549,6 +645,21 @@ export default function App() {
                   </div>
                   <div className="flex flex-wrap gap-3">
                     <button 
+                      onClick={() => setIsAddingContact(!isAddingContact)}
+                      className="flex items-center gap-2 px-4 py-2 bg-emerald-50 text-emerald-600 rounded-xl font-medium hover:bg-emerald-100 transition-colors"
+                    >
+                      <Plus size={18} />
+                      Add Contact
+                    </button>
+                    <a 
+                      href="/api/contacts/export"
+                      download
+                      className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-600 rounded-xl font-medium hover:bg-slate-200 transition-colors"
+                    >
+                      <Download size={18} />
+                      Export CSV
+                    </a>
+                    <button 
                       onClick={downloadDemoCSV}
                       className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-600 rounded-xl font-medium hover:bg-slate-200 transition-colors"
                     >
@@ -568,6 +679,50 @@ export default function App() {
                     </label>
                   </div>
                 </div>
+
+                {isAddingContact && (
+                  <motion.div 
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: 'auto', opacity: 1 }}
+                    className="p-8 bg-slate-50 border-b border-slate-100"
+                  >
+                    <form onSubmit={addSingleContact} className="flex flex-wrap gap-4 items-end">
+                      <div className="flex-1 min-w-[200px]">
+                        <label className="block text-xs font-bold text-slate-400 uppercase mb-1">Name</label>
+                        <input 
+                          type="text" 
+                          value={newContactName}
+                          onChange={(e) => setNewContactName(e.target.value)}
+                          className="w-full px-4 py-2 rounded-xl border border-slate-200 focus:ring-2 focus:ring-emerald-500 outline-none"
+                          placeholder="John Doe"
+                        />
+                      </div>
+                      <div className="flex-1 min-w-[200px]">
+                        <label className="block text-xs font-bold text-slate-400 uppercase mb-1">Phone</label>
+                        <input 
+                          type="text" 
+                          value={newContactPhone}
+                          onChange={(e) => setNewContactPhone(e.target.value)}
+                          className="w-full px-4 py-2 rounded-xl border border-slate-200 focus:ring-2 focus:ring-emerald-500 outline-none"
+                          placeholder="1234567890"
+                        />
+                      </div>
+                      <button 
+                        type="submit"
+                        className="px-6 py-2 bg-emerald-500 text-white rounded-xl font-bold hover:bg-emerald-600 transition-colors"
+                      >
+                        Save Contact
+                      </button>
+                      <button 
+                        type="button"
+                        onClick={() => setIsAddingContact(false)}
+                        className="px-6 py-2 bg-slate-200 text-slate-600 rounded-xl font-bold hover:bg-slate-300 transition-colors"
+                      >
+                        Cancel
+                      </button>
+                    </form>
+                  </motion.div>
+                )}
                 
                 <div className="overflow-x-auto">
                   <table className="w-full text-left">
@@ -852,14 +1007,133 @@ export default function App() {
                   </button>
                   
                   {isSending && (
-                    <div className="mt-4 w-full bg-slate-100 h-2 rounded-full overflow-hidden">
-                      <motion.div 
-                        className="bg-emerald-500 h-full"
-                        initial={{ width: 0 }}
-                        animate={{ width: `${(sendingProgress.current / sendingProgress.total) * 100}%` }}
-                      />
+                    <div className="mt-4 space-y-4">
+                      <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden">
+                        <motion.div 
+                          className="bg-emerald-500 h-full"
+                          initial={{ width: 0 }}
+                          animate={{ width: `${(sendingProgress.current / sendingProgress.total) * 100}%` }}
+                        />
+                      </div>
+                      <button 
+                        onClick={stopCampaign}
+                        className="w-full py-2 bg-rose-50 text-rose-600 rounded-xl text-xs font-bold hover:bg-rose-100 transition-colors flex items-center justify-center gap-2"
+                      >
+                        <XCircle size={14} />
+                        Stop Campaign
+                      </button>
                     </div>
                   )}
+                </div>
+              </div>
+            </motion.div>
+          )}
+
+          {activeTab === 'verifier' && (
+            <motion.div
+              key="verifier"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="grid grid-cols-1 lg:grid-cols-3 gap-8"
+            >
+              <div className="lg:col-span-1 space-y-6">
+                <div className="bg-white rounded-3xl p-8 border border-slate-200 shadow-sm">
+                  <h3 className="text-xl font-bold mb-6">Number Verifier</h3>
+                  <div className="space-y-4">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-2">Input Numbers</label>
+                      <textarea 
+                        value={verifyInput}
+                        onChange={(e) => setVerifyInput(e.target.value)}
+                        className="w-full h-64 p-4 rounded-2xl border border-slate-200 focus:ring-2 focus:ring-emerald-500 outline-none resize-none transition-all"
+                        placeholder="Enter numbers separated by comma or new line...&#10;e.g.&#10;1234567890&#10;0987654321"
+                      />
+                      <p className="mt-2 text-xs text-slate-400">Enter international format without '+' (e.g. 1234567890)</p>
+                    </div>
+                    
+                    <button 
+                      disabled={status !== 'open' || isVerifying || !verifyInput}
+                      onClick={handleVerifyNumbers}
+                      className="w-full py-4 bg-emerald-500 text-white rounded-2xl font-bold hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg shadow-emerald-100 flex items-center justify-center gap-2"
+                    >
+                      {isVerifying ? (
+                        <>
+                          <Loader2 className="animate-spin" size={20} />
+                          <span>Verifying...</span>
+                        </>
+                      ) : (
+                        <>
+                          <ShieldCheck size={20} />
+                          <span>Verify Numbers</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="lg:col-span-2">
+                <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden h-full flex flex-col">
+                  <div className="p-8 border-b border-slate-100 flex justify-between items-center">
+                    <h3 className="text-xl font-bold">Verification Results</h3>
+                    {verifyResults.length > 0 && (
+                      <div className="flex gap-2">
+                        <span className="px-3 py-1 bg-emerald-100 text-emerald-700 text-xs font-bold rounded-full">
+                          {verifyResults.filter(r => r.exists).length} WhatsApp
+                        </span>
+                        <span className="px-3 py-1 bg-slate-100 text-slate-600 text-xs font-bold rounded-full">
+                          {verifyResults.filter(r => !r.exists).length} Not Found
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                  
+                  <div className="flex-1 overflow-y-auto max-h-[600px]">
+                    <table className="w-full text-left">
+                      <thead className="bg-slate-50 text-slate-500 text-sm uppercase tracking-wider sticky top-0">
+                        <tr>
+                          <th className="px-8 py-4 font-semibold">Phone Number</th>
+                          <th className="px-8 py-4 font-semibold">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {verifyResults.map((result, idx) => (
+                          <tr key={idx} className="hover:bg-slate-50 transition-colors">
+                            <td className="px-8 py-4 font-medium">+{result.phone}</td>
+                            <td className="px-8 py-4">
+                              {result.exists ? (
+                                <span className="flex items-center gap-2 text-emerald-600 font-bold text-sm">
+                                  <CheckCircle2 size={16} />
+                                  WhatsApp Active
+                                </span>
+                              ) : (
+                                <span className="flex items-center gap-2 text-slate-400 font-medium text-sm">
+                                  <XCircle size={16} />
+                                  Not Registered
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                        {verifyResults.length === 0 && !isVerifying && (
+                          <tr>
+                            <td colSpan={2} className="px-8 py-20 text-center text-slate-400">
+                              <ShieldCheck size={48} className="mx-auto mb-4 opacity-20" />
+                              <p>Enter numbers and click verify to see results.</p>
+                            </td>
+                          </tr>
+                        )}
+                        {isVerifying && verifyResults.length === 0 && (
+                          <tr>
+                            <td colSpan={2} className="px-8 py-20 text-center text-slate-400">
+                              <Loader2 size={48} className="mx-auto mb-4 animate-spin opacity-20" />
+                              <p>Analyzing numbers...</p>
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               </div>
             </motion.div>
@@ -874,12 +1148,22 @@ export default function App() {
             >
               <div className="p-8 border-b border-slate-100 flex justify-between items-center">
                 <h3 className="text-xl font-bold">Message History</h3>
-                <button 
-                  onClick={clearHistory}
-                  className="text-sm font-medium text-rose-500 hover:underline"
-                >
-                  Clear History
-                </button>
+                <div className="flex gap-3">
+                  <a 
+                    href="/api/history/export"
+                    download
+                    className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-600 rounded-xl font-medium hover:bg-slate-200 transition-colors"
+                  >
+                    <Download size={18} />
+                    Export History
+                  </a>
+                  <button 
+                    onClick={clearHistory}
+                    className="text-sm font-medium text-rose-500 hover:underline"
+                  >
+                    Clear History
+                  </button>
+                </div>
               </div>
               
               <div className="overflow-x-auto">
@@ -974,9 +1258,20 @@ export default function App() {
                       {autoReplies.map(reply => (
                         <div key={reply.id} className="p-4 bg-slate-50 rounded-2xl border border-slate-100 group">
                           <div className="flex justify-between items-start mb-2">
-                            <span className="px-2 py-1 bg-emerald-100 text-emerald-700 text-[10px] font-bold rounded uppercase">
-                              {reply.keyword}
-                            </span>
+                            <div className="flex items-center gap-2">
+                              <span className="px-2 py-1 bg-emerald-100 text-emerald-700 text-[10px] font-bold rounded uppercase">
+                                {reply.keyword}
+                              </span>
+                              <button 
+                                onClick={() => toggleAutoReply(reply.id, !reply.enabled)}
+                                className={`w-8 h-4 rounded-full transition-colors relative ${reply.enabled ? 'bg-emerald-500' : 'bg-slate-300'}`}
+                              >
+                                <motion.div 
+                                  animate={{ x: reply.enabled ? 16 : 0 }}
+                                  className="absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full shadow-sm"
+                                />
+                              </button>
+                            </div>
                             <button 
                               onClick={() => deleteAutoReply(reply.id)}
                               className="text-slate-300 hover:text-rose-500 transition-colors"
