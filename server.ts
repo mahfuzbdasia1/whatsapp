@@ -4,6 +4,7 @@ import { Server } from "socket.io";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import fs from "fs";
+import { fileURLToPath } from "url";
 import { 
     makeWASocket, 
     DisconnectReason, 
@@ -19,6 +20,8 @@ import { parse } from "csv-parse/sync";
 
 const app = express();
 const httpServer = createServer(app);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 const io = new Server(httpServer, {
     cors: {
         origin: "*",
@@ -64,9 +67,16 @@ let connectionStatus: "connecting" | "open" | "close" | "qr" = "close";
 let stopCampaign = false;
 
 async function connectToWhatsApp() {
+    console.log("Starting WhatsApp connection process...");
     try {
+        if (!fs.existsSync("auth_info_baileys")) {
+            fs.mkdirSync("auth_info_baileys", { recursive: true });
+        }
         const { state, saveCreds } = await useMultiFileAuthState("auth_info_baileys");
-        const { version } = await fetchLatestBaileysVersion();
+        console.log("Auth state loaded");
+        
+        const { version, isLatest } = await fetchLatestBaileysVersion();
+        console.log(`Using Baileys v${version.join(".")}, isLatest: ${isLatest}`);
 
         sock = makeWASocket({
             version,
@@ -161,11 +171,11 @@ app.get("/api/contacts", (req, res) => {
 });
 
 app.post("/api/contacts", (req, res) => {
-    const { name, phone } = req.body;
+    const { name, phone, tags } = req.body;
     const cleanPhone = phone.replace(/\D/g, "");
     try {
-        const result = db.prepare("INSERT INTO contacts (name, phone) VALUES (?, ?)").run(name, cleanPhone);
-        res.json({ id: result.lastInsertRowid, name, phone: cleanPhone });
+        const result = db.prepare("INSERT INTO contacts (name, phone, tags) VALUES (?, ?, ?)").run(name, cleanPhone, tags || "");
+        res.json({ id: result.lastInsertRowid, name, phone: cleanPhone, tags });
     } catch (e) {
         res.status(400).json({ error: "Contact already exists" });
     }
@@ -315,8 +325,11 @@ app.post("/api/contacts/import", upload.single("file"), (req: any, res) => {
     }
 });
 
-app.post("/api/send-bulk", async (req, res) => {
-    const { message, contacts } = req.body;
+app.post("/api/send-bulk", upload.single("media"), async (req: any, res) => {
+    const { message, contacts: contactsJson } = req.body;
+    const contacts = JSON.parse(contactsJson);
+    const mediaFile = req.file;
+
     if (connectionStatus !== "open") return res.status(400).json({ error: "WhatsApp not connected" });
 
     stopCampaign = false;
@@ -328,26 +341,45 @@ app.post("/api/send-bulk", async (req, res) => {
             break;
         }
         try {
-            // Replace placeholders
             const personalizedMessage = message.replace(/{name}/g, contact.name || "Customer");
             const jid = `${contact.phone}@s.whatsapp.net`;
             
-            await sock.sendMessage(jid, { text: personalizedMessage });
+            if (mediaFile) {
+                const mediaType = mediaFile.mimetype.startsWith("image/") ? "image" : "document";
+                const mediaContent: any = {
+                    caption: personalizedMessage
+                };
+                
+                if (mediaType === "image") {
+                    mediaContent.image = fs.readFileSync(mediaFile.path);
+                } else {
+                    mediaContent.document = fs.readFileSync(mediaFile.path);
+                    mediaContent.fileName = mediaFile.originalname;
+                    mediaContent.mimetype = mediaFile.mimetype;
+                }
+
+                await sock.sendMessage(jid, mediaContent);
+            } else {
+                await sock.sendMessage(jid, { text: personalizedMessage });
+            }
             
             db.prepare("INSERT INTO messages (phone, content, status) VALUES (?, ?, ?)").run(
                 contact.phone,
-                personalizedMessage,
+                personalizedMessage + (mediaFile ? " [Media]" : ""),
                 "sent"
             );
             
             io.emit("send-progress", { phone: contact.phone, status: "sent" });
             
-            // Random delay to prevent ban (2-5 seconds)
-            await new Promise(resolve => setTimeout(resolve, 2000 + Math.random() * 3000));
+            await new Promise(resolve => setTimeout(resolve, 3000 + Math.random() * 4000));
         } catch (error) {
             console.error(`Failed to send to ${contact.phone}`, error);
             io.emit("send-progress", { phone: contact.phone, status: "failed" });
         }
+    }
+    
+    if (mediaFile) {
+        fs.unlinkSync(mediaFile.path);
     }
     io.emit("campaign-finished");
 });
@@ -355,6 +387,34 @@ app.post("/api/send-bulk", async (req, res) => {
 app.post("/api/stop-campaign", (req, res) => {
     stopCampaign = true;
     res.json({ success: true });
+});
+
+app.post("/api/restart", async (req, res) => {
+    try {
+        if (sock) {
+            try {
+                await sock.logout();
+            } catch (e) {}
+            sock.ev.removeAllListeners("connection.update");
+            sock = null;
+        }
+        
+        qrCode = null;
+        connectionStatus = "close";
+        
+        // Clear session folder
+        if (fs.existsSync("auth_info_baileys")) {
+            fs.rmSync("auth_info_baileys", { recursive: true, force: true });
+        }
+        
+        // Reconnect
+        connectToWhatsApp();
+        
+        res.json({ success: true });
+    } catch (error) {
+        console.error("Restart failed:", error);
+        res.status(500).json({ error: "Failed to restart connection" });
+    }
 });
 
 app.post("/api/logout", async (req, res) => {

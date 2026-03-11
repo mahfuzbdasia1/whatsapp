@@ -18,6 +18,7 @@ import {
   Plus,
   Trash2,
   FileText,
+  Image as ImageIcon,
   Zap,
   Edit2,
   UserCheck,
@@ -42,6 +43,7 @@ interface Contact {
   id: number;
   name: string;
   phone: string;
+  tags?: string;
 }
 
 interface MessageLog {
@@ -104,7 +106,12 @@ export default function App() {
   // New Contact State
   const [newContactName, setNewContactName] = useState('');
   const [newContactPhone, setNewContactPhone] = useState('');
+  const [newContactTags, setNewContactTags] = useState('');
   const [isAddingContact, setIsAddingContact] = useState(false);
+  const [tagFilter, setTagFilter] = useState('');
+  
+  // Campaign State
+  const [selectedMedia, setSelectedMedia] = useState<File | null>(null);
   
   // Verifier State
   const [verifyInput, setVerifyInput] = useState('');
@@ -272,11 +279,16 @@ export default function App() {
       const res = await fetch('/api/contacts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: newContactName, phone: newContactPhone }),
+        body: JSON.stringify({ 
+          name: newContactName, 
+          phone: newContactPhone,
+          tags: newContactTags 
+        }),
       });
       if (res.ok) {
         setNewContactName('');
         setNewContactPhone('');
+        setNewContactTags('');
         setIsAddingContact(false);
         fetchContacts();
       } else {
@@ -288,10 +300,14 @@ export default function App() {
     }
   };
 
-  const filteredContacts = contacts.filter(c => 
-    c.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
-    c.phone.includes(searchQuery)
-  );
+  const filteredContacts = contacts.filter(c => {
+    const matchesSearch = c.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
+                         c.phone.includes(searchQuery);
+    const matchesTag = !tagFilter || (c.tags && c.tags.toLowerCase().includes(tagFilter.toLowerCase()));
+    return matchesSearch && matchesTag;
+  });
+
+  const allTags = Array.from(new Set(contacts.flatMap(c => c.tags ? c.tags.split(',').map(t => t.trim()) : []))).filter(Boolean);
 
   const deleteContact = async (id: number) => {
     if (!confirm('Are you sure you want to delete this contact?')) return;
@@ -385,11 +401,17 @@ export default function App() {
     setIsSending(true);
     setSendingProgress({ current: 0, total: targetContacts.length });
     
+    const formData = new FormData();
+    formData.append('message', message);
+    formData.append('contacts', JSON.stringify(targetContacts));
+    if (selectedMedia) {
+      formData.append('media', selectedMedia);
+    }
+
     try {
       await fetch('/api/send-bulk', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message, contacts: targetContacts }),
+        body: formData,
       });
     } catch (e) {
       console.error('Bulk send failed');
@@ -438,6 +460,17 @@ export default function App() {
       fetchStatus();
     } catch (e) {
       console.error('Logout failed');
+    }
+  };
+
+  const handleRestart = async () => {
+    try {
+      setStatus('close');
+      setQr(null);
+      await fetch('/api/restart', { method: 'POST' });
+      fetchStatus();
+    } catch (e) {
+      console.error('Restart failed');
     }
   };
 
@@ -547,6 +580,12 @@ export default function App() {
                       <div className="bg-white p-6 rounded-2xl shadow-xl">
                         <QRCodeSVG value={qr} size={256} />
                         <p className="mt-4 text-center text-sm font-medium text-slate-600">Scan this QR code</p>
+                        <button 
+                          onClick={handleRestart}
+                          className="mt-4 w-full text-xs font-bold text-slate-400 hover:text-emerald-600 transition-colors"
+                        >
+                          QR not working? Refresh
+                        </button>
                       </div>
                     ) : status === 'open' ? (
                       <div className="text-center">
@@ -560,6 +599,12 @@ export default function App() {
                       <div className="text-center">
                         <Loader2 className="animate-spin text-slate-400 mx-auto mb-4" size={40} />
                         <p className="text-slate-500">Initializing WhatsApp connection...</p>
+                        <button 
+                          onClick={handleRestart}
+                          className="mt-4 text-xs font-bold text-emerald-600 hover:underline"
+                        >
+                          Refresh Connection
+                        </button>
                       </div>
                     )}
                   </div>
@@ -643,6 +688,23 @@ export default function App() {
                       className="w-full pl-12 pr-4 py-2 rounded-xl border border-slate-200 focus:ring-2 focus:ring-emerald-500 outline-none transition-all"
                     />
                   </div>
+                  <div className="flex items-center gap-2 overflow-x-auto pb-2 md:pb-0">
+                    <button 
+                      onClick={() => setTagFilter('')}
+                      className={`px-3 py-1 rounded-full text-xs font-bold whitespace-nowrap transition-colors ${!tagFilter ? 'bg-emerald-500 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+                    >
+                      All
+                    </button>
+                    {allTags.map(tag => (
+                      <button 
+                        key={tag}
+                        onClick={() => setTagFilter(tag)}
+                        className={`px-3 py-1 rounded-full text-xs font-bold whitespace-nowrap transition-colors ${tagFilter === tag ? 'bg-emerald-500 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+                      >
+                        {tag}
+                      </button>
+                    ))}
+                  </div>
                   <div className="flex flex-wrap gap-3">
                     <button 
                       onClick={() => setIsAddingContact(!isAddingContact)}
@@ -707,6 +769,16 @@ export default function App() {
                           placeholder="1234567890"
                         />
                       </div>
+                      <div className="flex-1 min-w-[200px]">
+                        <label className="block text-xs font-bold text-slate-400 uppercase mb-1">Tags (comma separated)</label>
+                        <input 
+                          type="text" 
+                          value={newContactTags}
+                          onChange={(e) => setNewContactTags(e.target.value)}
+                          className="w-full px-4 py-2 rounded-xl border border-slate-200 focus:ring-2 focus:ring-emerald-500 outline-none"
+                          placeholder="VIP, Customer, Leads"
+                        />
+                      </div>
                       <button 
                         type="submit"
                         className="px-6 py-2 bg-emerald-500 text-white rounded-xl font-bold hover:bg-emerald-600 transition-colors"
@@ -738,7 +810,8 @@ export default function App() {
                         </th>
                         <th className="px-8 py-4 font-semibold">Name</th>
                         <th className="px-8 py-4 font-semibold">Phone Number</th>
-                        <th className="px-8 py-4 font-semibold">Actions</th>
+                        <th className="px-8 py-4 font-semibold">Tags</th>
+                        <th className="px-8 py-4 font-semibold text-right">Actions</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
@@ -754,6 +827,15 @@ export default function App() {
                           </td>
                           <td className="px-8 py-4 font-medium">{contact.name}</td>
                           <td className="px-8 py-4 text-slate-500">{contact.phone}</td>
+                          <td className="px-8 py-4">
+                            <div className="flex flex-wrap gap-1">
+                              {contact.tags ? contact.tags.split(',').map((tag: string, i: number) => (
+                                <span key={i} className="px-2 py-0.5 bg-slate-100 text-slate-600 text-[10px] font-bold rounded uppercase">
+                                  {tag.trim()}
+                                </span>
+                              )) : <span className="text-slate-300 text-[10px]">—</span>}
+                            </div>
+                          </td>
                           <td className="px-8 py-4">
                             <button 
                               onClick={() => deleteContact(contact.id)}
@@ -901,6 +983,41 @@ export default function App() {
                             Save as Template
                           </button>
                         </div>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-2">Attach Media (Optional)</label>
+                      <div className={`relative border-2 border-dashed rounded-2xl p-8 transition-all flex flex-col items-center justify-center gap-3 ${selectedMedia ? 'border-emerald-500 bg-emerald-50' : 'border-slate-200 hover:border-emerald-500 hover:bg-slate-50'}`}>
+                        {selectedMedia ? (
+                          <>
+                            <div className="flex items-center gap-3 text-emerald-600">
+                              <FileText size={24} />
+                              <span className="font-medium">{selectedMedia.name}</span>
+                            </div>
+                            <button 
+                              onClick={() => setSelectedMedia(null)}
+                              className="text-xs font-bold text-rose-500 hover:underline"
+                            >
+                              Remove Media
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center text-slate-400">
+                              <ImageIcon size={24} />
+                            </div>
+                            <div className="text-center">
+                              <p className="text-sm font-medium text-slate-600">Click to upload image or document</p>
+                              <p className="text-xs text-slate-400 mt-1">Supports JPG, PNG, PDF (Max 16MB)</p>
+                            </div>
+                            <input 
+                              type="file" 
+                              className="absolute inset-0 opacity-0 cursor-pointer"
+                              onChange={(e) => setSelectedMedia(e.target.files?.[0] || null)}
+                            />
+                          </>
+                        )}
                       </div>
                     </div>
                     
